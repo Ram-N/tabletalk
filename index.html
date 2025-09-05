@@ -18,27 +18,69 @@
     <!-- Main Container -->
     <div class="bg-gray-800 p-8 rounded-xl shadow-lg w-full max-w-2xl flex flex-col space-y-6">
         <h1 class="text-3xl font-bold text-center text-indigo-400">TableTalk CSV Agent</h1>
-        <p class="text-center text-gray-400">Ask questions about your CSV data and watch the agent's thinking process.</p>
+        <p class="text-center text-gray-400">Upload your CSV file and ask questions about your data with AI-powered analysis.</p>
 
-        <!-- Input and Button -->
-        <div class="flex space-x-4 w-full">
-            <input
+        <!-- File Upload Section -->
+        <div class="bg-gray-700 p-4 rounded-lg border border-gray-600">
+            <h3 class="text-lg font-semibold text-green-400 mb-3">📁 Upload CSV File</h3>
+            <div class="flex items-center space-x-4">
+                <input
+                    type="file"
+                    id="csvFileInput"
+                    accept=".csv"
+                    class="block w-full text-sm text-gray-400 file:mr-4 file:py-2 file:px-4 file:rounded-lg file:border-0 file:text-sm file:font-semibold file:bg-indigo-600 file:text-white hover:file:bg-indigo-700 file:cursor-pointer"
+                />
+                <button
+                    id="uploadButton"
+                    class="bg-green-600 hover:bg-green-700 text-white font-bold py-2 px-4 rounded-lg shadow-md transition-all duration-200 transform active:scale-95 disabled:bg-green-400"
+                >
+                    Upload
+                </button>
+            </div>
+            <div id="fileInfo" class="mt-3 text-sm text-gray-300 hidden">
+                <p id="fileDetails"></p>
+            </div>
+            <div id="uploadStatus" class="mt-2 text-sm hidden"></div>
+        </div>
+
+        <!-- Large Input Area -->
+        <div class="w-full">
+            <textarea
                 id="promptInput"
-                type="text"
-                placeholder="e.g., How many students are there in the dataset?"
-                class="flex-grow p-3 rounded-lg bg-gray-700 border border-gray-600 focus:outline-none focus:border-indigo-500 transition-colors placeholder-gray-400"
-            />
+                rows="6"
+                placeholder="e.g., How many students are there in the dataset? What's the age distribution? Which city has the most students?
+
+You can ask complex questions and the agent will analyze the CSV data to provide detailed answers."
+                class="w-full p-4 rounded-lg bg-gray-700 border border-gray-600 focus:outline-none focus:border-indigo-500 transition-colors placeholder-gray-400 resize-none min-h-[150px]"
+            ></textarea>
+        </div>
+
+        <!-- Stream Mode Toggle -->
+        <div class="flex items-center space-x-3">
+            <label class="flex items-center space-x-2 cursor-pointer">
+                <input
+                    type="checkbox"
+                    id="streamToggle"
+                    checked
+                    class="w-4 h-4 text-green-600 bg-gray-700 border-gray-600 rounded focus:ring-green-500 focus:ring-2"
+                />
+                <span class="text-sm text-gray-300">Stream thinking process (show agent's reasoning in real-time)</span>
+            </label>
+        </div>
+
+        <!-- Action Buttons -->
+        <div class="flex space-x-4 w-full">
             <button
-                id="sendButton"
-                class="bg-indigo-600 hover:bg-indigo-700 text-white font-bold py-3 px-6 rounded-lg shadow-md transition-all duration-200 transform active:scale-95 disabled:bg-indigo-400"
+                id="askButton"
+                class="flex-1 bg-indigo-600 hover:bg-indigo-700 text-white font-bold py-3 px-6 rounded-lg shadow-md transition-all duration-200 transform active:scale-95 disabled:bg-indigo-400"
             >
                 Ask Agent
             </button>
             <button
-                id="streamButton"
-                class="bg-green-600 hover:bg-green-700 text-white font-bold py-3 px-6 rounded-lg shadow-md transition-all duration-200 transform active:scale-95 disabled:bg-green-400"
+                id="clearButton"
+                class="bg-gray-600 hover:bg-gray-700 text-white font-bold py-3 px-4 rounded-lg shadow-md transition-all duration-200 transform active:scale-95"
             >
-                Stream Thinking
+                Clear
             </button>
         </div>
 
@@ -47,10 +89,10 @@
             <div class="flex items-center space-x-2">
                 <label class="text-sm text-gray-400">Timeout:</label>
                 <select id="timeoutSelect" class="bg-gray-700 border border-gray-600 rounded px-2 py-1 text-sm">
-                    <option value="30">30 seconds</option>
-                    <option value="60" selected>1 minute</option>
+                    <option value="60">1 minute</option>
                     <option value="120">2 minutes</option>
-                    <option value="300">5 minutes</option>
+                    <option value="300" selected>5 minutes</option>
+                    <option value="600">10 minutes</option>
                 </select>
             </div>
             <div id="abortSection" class="hidden flex items-center space-x-2">
@@ -82,16 +124,25 @@
             <p id="responseOutput" class="whitespace-pre-wrap"></p>
         </div>
 
+        <!-- Server Status -->
+        <div class="flex items-center justify-center space-x-2 mt-4">
+            <div id="serverStatus" class="flex items-center space-x-2">
+                <div id="statusDot" class="w-3 h-3 rounded-full bg-green-400"></div>
+                <span id="statusText" class="text-sm text-green-400">Server Online</span>
+            </div>
+        </div>
+
         <!-- Environment Variable Warning -->
-        <div class="text-center text-red-400 mt-4 text-xs">
+        <div class="text-center text-red-400 mt-2 text-xs">
             <p>Ensure `GROQ_API_KEY` is set as an environment variable on your backend server.</p>
         </div>
     </div>
 
     <script>
         const promptInput = document.getElementById('promptInput');
-        const sendButton = document.getElementById('sendButton');
-        const streamButton = document.getElementById('streamButton');
+        const askButton = document.getElementById('askButton');
+        const clearButton = document.getElementById('clearButton');
+        const streamToggle = document.getElementById('streamToggle');
         const loadingDiv = document.getElementById('loading');
         const responseOutput = document.getElementById('responseOutput');
         const thinkingContainer = document.getElementById('thinkingContainer');
@@ -101,9 +152,23 @@
         const abortButton = document.getElementById('abortButton');
         const countdown = document.getElementById('countdown');
         
+        // File upload elements
+        const csvFileInput = document.getElementById('csvFileInput');
+        const uploadButton = document.getElementById('uploadButton');
+        const fileInfo = document.getElementById('fileInfo');
+        const fileDetails = document.getElementById('fileDetails');
+        const uploadStatus = document.getElementById('uploadStatus');
+        
+        // Server status elements
+        const statusDot = document.getElementById('statusDot');
+        const statusText = document.getElementById('statusText');
+        
         let currentEventSource = null;
         let currentRequestId = null;
         let countdownInterval = null;
+        let isFileUploaded = false;
+        let serverHealthInterval = null;
+        let lastServerCheck = Date.now();
         
         // Function to make standard API call
         async function askAgent() {
@@ -137,7 +202,8 @@
 
             } catch (error) {
                 console.error('Error fetching data:', error);
-                responseOutput.textContent = `Error: ${error.message}. Please check the backend server and console for details.`;
+                updateServerStatus(false);
+                responseOutput.textContent = `Error: ${error.message}. Server may have crashed - please refresh the page.`;
             } finally {
                 hideLoading();
             }
@@ -204,7 +270,8 @@
                 
                 currentEventSource.onerror = function(event) {
                     console.error('EventSource failed:', event);
-                    responseOutput.textContent = 'Connection error. Please try again.';
+                    updateServerStatus(false);
+                    responseOutput.textContent = 'Connection error. Server may have crashed - please refresh the page.';
                     endStream();
                 };
                 
@@ -242,15 +309,191 @@
         }
         
         function showLoading() {
-            sendButton.disabled = true;
-            streamButton.disabled = true;
+            askButton.disabled = true;
             loadingDiv.classList.remove('hidden');
         }
         
         function hideLoading() {
-            sendButton.disabled = false;
-            streamButton.disabled = false;
+            askButton.disabled = false;
             loadingDiv.classList.add('hidden');
+        }
+        
+        function clearAll() {
+            promptInput.value = '';
+            resetUI();
+        }
+        
+        function handleAskAgent() {
+            if (!isFileUploaded) {
+                showUploadError("Please upload a CSV file first before asking questions.");
+                return;
+            }
+            
+            if (streamToggle.checked) {
+                askAgentStream();
+            } else {
+                askAgent();
+            }
+        }
+        
+        // File upload functionality
+        async function uploadFile() {
+            const file = csvFileInput.files[0];
+            if (!file) {
+                showUploadError("Please select a CSV file to upload.");
+                return;
+            }
+            
+            if (!file.name.endsWith('.csv')) {
+                showUploadError("Please select a valid CSV file.");
+                return;
+            }
+            
+            const formData = new FormData();
+            formData.append('file', file);
+            
+            uploadButton.disabled = true;
+            uploadButton.textContent = 'Uploading...';
+            showUploadStatus("Uploading and processing CSV file...", "text-blue-400");
+            
+            try {
+                const response = await fetch('http://localhost:8000/upload', {
+                    method: 'POST',
+                    body: formData
+                });
+                
+                if (!response.ok) {
+                    const errorData = await response.json();
+                    throw new Error(errorData.detail || 'Upload failed');
+                }
+                
+                const data = await response.json();
+                
+                // Show success
+                showUploadStatus(`✅ ${data.message}`, "text-green-400");
+                showFileInfo(data);
+                isFileUploaded = true;
+                
+                // Update UI state
+                askButton.disabled = false;
+                promptInput.disabled = false;
+                
+            } catch (error) {
+                console.error('Upload error:', error);
+                if (error.message.includes('fetch')) {
+                    updateServerStatus(false);
+                }
+                showUploadError(`Upload failed: ${error.message}`);
+                isFileUploaded = false;
+            } finally {
+                uploadButton.disabled = false;
+                uploadButton.textContent = 'Upload';
+            }
+        }
+        
+        function showFileInfo(data) {
+            fileDetails.textContent = `📊 ${data.filename} • ${data.rows} rows • ${data.columns.length} columns`;
+            fileInfo.classList.remove('hidden');
+        }
+        
+        function showUploadStatus(message, colorClass) {
+            uploadStatus.textContent = message;
+            uploadStatus.className = `mt-2 text-sm ${colorClass}`;
+            uploadStatus.classList.remove('hidden');
+        }
+        
+        function showUploadError(message) {
+            showUploadStatus(`❌ ${message}`, "text-red-400");
+        }
+        
+        // Check if file is already loaded on page load
+        async function checkFileStatus() {
+            try {
+                const response = await fetch('http://localhost:8000/data-info');
+                const data = await response.json();
+                
+                // Server is responsive
+                updateServerStatus(true);
+                
+                if (!data.error) {
+                    showFileInfo(data);
+                    isFileUploaded = true;
+                    askButton.disabled = false;
+                    promptInput.disabled = false;
+                    showUploadStatus("✅ CSV file is loaded and ready", "text-green-400");
+                } else {
+                    askButton.disabled = true;
+                    promptInput.disabled = true;
+                    showUploadStatus("📂 Please upload a CSV file to get started", "text-yellow-400");
+                }
+            } catch (error) {
+                console.error('Error checking file status:', error);
+                updateServerStatus(false);
+                askButton.disabled = true;
+                promptInput.disabled = true;
+                showUploadStatus("⚠️ Server connection error", "text-red-400");
+            }
+        }
+        
+        // Server health monitoring
+        async function checkServerHealth() {
+            try {
+                const controller = new AbortController();
+                const timeoutId = setTimeout(() => controller.abort(), 5000); // 5 second timeout
+                
+                const response = await fetch('http://localhost:8000/api', {
+                    method: 'GET',
+                    signal: controller.signal
+                });
+                
+                clearTimeout(timeoutId);
+                
+                if (response.ok) {
+                    updateServerStatus(true);
+                    lastServerCheck = Date.now();
+                } else {
+                    updateServerStatus(false);
+                }
+            } catch (error) {
+                console.error('Server health check failed:', error);
+                updateServerStatus(false);
+            }
+        }
+        
+        function updateServerStatus(isOnline) {
+            if (isOnline) {
+                statusDot.className = 'w-3 h-3 rounded-full bg-green-400';
+                statusText.textContent = 'Server Online';
+                statusText.className = 'text-sm text-green-400';
+            } else {
+                statusDot.className = 'w-3 h-3 rounded-full bg-red-400';
+                statusText.textContent = 'Server Offline - Please refresh page';
+                statusText.className = 'text-sm text-red-400';
+                
+                // Show server crash message in response area
+                if (responseOutput.textContent === '' || responseOutput.textContent === 'Processing...') {
+                    responseOutput.textContent = '🚨 Server Connection Lost\n\nThe server appears to have crashed or is unresponsive. Please:\n\n1. Refresh the page\n2. Wait a moment for the server to restart\n3. Try your request again\n\nIf the problem persists, the server may need manual restart.';
+                }
+                
+                // Disable interactions
+                askButton.disabled = true;
+                uploadButton.disabled = true;
+            }
+        }
+        
+        function startServerMonitoring() {
+            // Check server health every 10 seconds
+            serverHealthInterval = setInterval(checkServerHealth, 10000);
+            
+            // Initial check
+            checkServerHealth();
+        }
+        
+        function stopServerMonitoring() {
+            if (serverHealthInterval) {
+                clearInterval(serverHealthInterval);
+                serverHealthInterval = null;
+            }
         }
         
         function endStream() {
@@ -293,18 +536,41 @@
         }
 
         // Add event listeners
-        sendButton.addEventListener('click', askAgent);
-        streamButton.addEventListener('click', askAgentStream);
+        askButton.addEventListener('click', handleAskAgent);
+        clearButton.addEventListener('click', clearAll);
         abortButton.addEventListener('click', abortRequest);
+        uploadButton.addEventListener('click', uploadFile);
 
         promptInput.addEventListener('keydown', (event) => {
-            if (event.key === 'Enter') {
-                if (event.shiftKey) {
-                    askAgentStream();
-                } else {
-                    askAgent();
-                }
+            if (event.key === 'Enter' && !event.shiftKey) {
+                event.preventDefault();
+                handleAskAgent();
             }
+        });
+        
+        // File input change listener
+        csvFileInput.addEventListener('change', (event) => {
+            const file = event.target.files[0];
+            if (file) {
+                uploadStatus.classList.add('hidden');
+            }
+        });
+        
+        // Initialize page
+        document.addEventListener('DOMContentLoaded', () => {
+            checkFileStatus();
+            startServerMonitoring();
+        });
+        
+        // Check file status on page load
+        checkFileStatus();
+        
+        // Start server monitoring
+        startServerMonitoring();
+        
+        // Cleanup when page unloads
+        window.addEventListener('beforeunload', () => {
+            stopServerMonitoring();
         });
     </script>
 </body>

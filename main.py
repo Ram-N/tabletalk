@@ -5,7 +5,7 @@ import json
 import threading
 from contextlib import asynccontextmanager
 from typing import AsyncGenerator
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, HTTPException, UploadFile, File
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import StreamingResponse, HTMLResponse
 from fastapi.staticfiles import StaticFiles
@@ -23,23 +23,29 @@ from langchain.agents import AgentType
 # Load environment variables from .env file
 load_dotenv()
 
-# CSV file path
-CSV_FILE_PATH = "data/dataset.csv"
+# CSV file management
+UPLOADS_DIR = "uploads"
+DEFAULT_CSV_PATH = "data/dataset.csv"
+current_csv_path = DEFAULT_CSV_PATH
 
-# Check if CSV file exists
-if not os.path.exists(CSV_FILE_PATH):
-    raise FileNotFoundError(f"CSV file not found: {CSV_FILE_PATH}")
+# Create uploads directory
+os.makedirs(UPLOADS_DIR, exist_ok=True)
 
-print(f"CSV file found: {CSV_FILE_PATH}")
+# Check if default CSV file exists
+if os.path.exists(DEFAULT_CSV_PATH):
+    print(f"Default CSV file found: {DEFAULT_CSV_PATH}")
+else:
+    current_csv_path = None
+    print("No default CSV file found. Please upload a CSV file to get started.")
 
 # Set up Pydantic models for request bodies
 class PromptRequest(BaseModel):
     prompt: str = Field(..., description="The user's query or instruction.")
-    timeout: int = Field(60, description="Timeout in seconds for the agent response.")
+    timeout: int = Field(300, description="Timeout in seconds for the agent response.")
 
 class StreamPromptRequest(BaseModel):
     prompt: str = Field(..., description="The user's query or instruction.")
-    timeout: int = Field(60, description="Timeout in seconds for the agent response.")
+    timeout: int = Field(300, description="Timeout in seconds for the agent response.")
 
 # Global variables for request cancellation
 active_requests = {}
@@ -74,12 +80,14 @@ except Exception as e:
     raise HTTPException(status_code=500, detail=f"Failed to initialize ChatGroq: {e}.")
 
 # Create CSV agent function
-def create_csv_agent_instance():
-    """Create a new CSV agent instance"""
+def create_csv_agent_instance(csv_file_path):
+    """Create a new CSV agent instance for the given file"""
+    if not csv_file_path or not os.path.exists(csv_file_path):
+        return None
     try:
         return create_csv_agent(
             groq_llm,
-            CSV_FILE_PATH,
+            csv_file_path,
             verbose=True,
             agent_type=AgentType.ZERO_SHOT_REACT_DESCRIPTION,
             allow_dangerous_code=True  # Required for CSV agent to execute pandas code
@@ -87,30 +95,70 @@ def create_csv_agent_instance():
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Failed to create CSV agent: {e}")
 
-# Create a global agent instance
-csv_agent = create_csv_agent_instance()
+# Create a global agent instance (if default file exists)
+csv_agent = create_csv_agent_instance(current_csv_path) if current_csv_path else None
 
-print(f"CSV agent initialized successfully with file: {CSV_FILE_PATH}")
+if csv_agent:
+    print(f"CSV agent initialized successfully with file: {current_csv_path}")
+else:
+    print("No CSV agent initialized. Upload a file to create one.")
 
-# Helper function to capture agent output
-class AgentOutputCapture:
+# Simple stdout capture for agent verbose output
+import contextlib
+from io import StringIO
+
+class VerboseCapture:
     def __init__(self):
-        self.outputs = []
-        self.original_stdout = sys.stdout
-        self.original_stderr = sys.stderr
+        self.captured_output = StringIO()
         
-    def __enter__(self):
-        self.string_io = io.StringIO()
-        sys.stdout = self.string_io
-        sys.stderr = self.string_io
-        return self
-        
-    def __exit__(self, type, value, traceback):
-        sys.stdout = self.original_stdout
-        sys.stderr = self.original_stderr
-        
+    @contextlib.contextmanager
+    def capture(self):
+        old_stdout = sys.stdout
+        old_stderr = sys.stderr
+        try:
+            sys.stdout = self.captured_output
+            sys.stderr = self.captured_output
+            yield self
+        finally:
+            sys.stdout = old_stdout
+            sys.stderr = old_stderr
+            
     def get_output(self):
-        return self.string_io.getvalue()
+        return self.captured_output.getvalue()
+        
+    def get_formatted_steps(self):
+        """Parse the captured output and format it nicely"""
+        output = self.get_output()
+        if not output:
+            return []
+            
+        lines = output.split('\n')
+        formatted_steps = []
+        
+        for line in lines:
+            line = line.strip()
+            if not line:
+                continue
+                
+            # Format different types of output
+            if line.startswith('Thought:'):
+                formatted_steps.append(f"🤔 {line}")
+            elif line.startswith('Action:'):
+                formatted_steps.append(f"🛠️ {line}")
+            elif line.startswith('Action Input:'):
+                formatted_steps.append(f"📝 {line}")
+            elif line.startswith('Observation:'):
+                # Truncate long observations
+                obs = line[12:] if len(line) > 12 else ""
+                if len(obs) > 200:
+                    obs = obs[:200] + "..."
+                formatted_steps.append(f"✅ Observation: {obs}")
+            elif 'Final Answer:' in line:
+                formatted_steps.append(f"🎯 {line}")
+            elif line and len(line.strip()) > 0:
+                formatted_steps.append(f"💭 {line}")
+                
+        return formatted_steps
 
 # --- API Endpoints ---
 @app.get("/", response_class=HTMLResponse)
@@ -125,17 +173,93 @@ async def root():
 
 @app.get("/api")
 async def api_info():
-    return {"message": "TableTalk CSV Agent API is running", "endpoints": ["/ask", "/ask-stream", "/abort/{request_id}", "/data-info", "/docs"]}
+    return {"message": "TableTalk CSV Agent API is running", "endpoints": ["/ask", "/ask-stream", "/abort/{request_id}", "/upload", "/data-info", "/health", "/docs"], "status": "online", "timestamp": asyncio.get_event_loop().time()}
+
+@app.get("/health")
+async def health_check():
+    """Simple health check endpoint for monitoring"""
+    return {"status": "healthy", "timestamp": asyncio.get_event_loop().time()}
+
+@app.post("/upload")
+async def upload_csv_file(file: UploadFile = File(...)):
+    """Upload a CSV file and create a new agent for it"""
+    global csv_agent, current_csv_path
+    
+    # Validate file type
+    if not file.filename or not file.filename.endswith('.csv'):
+        raise HTTPException(status_code=400, detail="Only CSV files are allowed")
+    
+    # Validate file size (max 10MB)
+    if file.size and file.size > 10 * 1024 * 1024:
+        raise HTTPException(status_code=400, detail="File size must be less than 10MB")
+    
+    try:
+        # Save uploaded file
+        file_path = os.path.join(UPLOADS_DIR, file.filename)
+        with open(file_path, "wb") as buffer:
+            content = await file.read()
+            buffer.write(content)
+        
+        # Validate CSV format
+        import pandas as pd
+        try:
+            df = pd.read_csv(file_path)
+            if len(df) == 0:
+                raise ValueError("CSV file is empty")
+            if len(df.columns) == 0:
+                raise ValueError("CSV file has no columns")
+        except Exception as e:
+            os.remove(file_path)  # Clean up invalid file
+            raise HTTPException(status_code=400, detail=f"Invalid CSV file: {str(e)}")
+        
+        # Create new CSV agent
+        new_agent = create_csv_agent_instance(file_path)
+        if new_agent is None:
+            os.remove(file_path)
+            raise HTTPException(status_code=500, detail="Failed to create CSV agent")
+        
+        # Update global state
+        old_csv_path = current_csv_path
+        csv_agent = new_agent
+        current_csv_path = file_path
+        
+        # Clean up old uploaded file (but not the default file)
+        if old_csv_path and old_csv_path != DEFAULT_CSV_PATH and os.path.exists(old_csv_path):
+            os.remove(old_csv_path)
+        
+        # Convert sample data to JSON-safe format (handle NaN values)
+        sample_data = df.head().fillna("").to_dict()
+        
+        return {
+            "message": "CSV file uploaded successfully",
+            "filename": file.filename,
+            "rows": len(df),
+            "columns": list(df.columns),
+            "sample_data": sample_data
+        }
+        
+    except HTTPException:
+        raise
+    except Exception as e:
+        # Clean up file on error
+        file_path = os.path.join(UPLOADS_DIR, file.filename)
+        if os.path.exists(file_path):
+            os.remove(file_path)
+        raise HTTPException(status_code=500, detail=f"Error processing file: {str(e)}")
 
 @app.post("/ask")
 async def ask_agent(request: PromptRequest):
     """
     Standard endpoint to send a prompt to the CSV agent and get a complete response.
     """
+    if csv_agent is None:
+        raise HTTPException(status_code=400, detail="No CSV file loaded. Please upload a CSV file first.")
+    
     try:
         # Run the CSV agent with timeout
         def run_agent():
-            return csv_agent.run(request.prompt)
+            response = csv_agent.invoke({"input": request.prompt})
+            return response.get("output", "No response generated")
         
         # Execute with timeout
         try:
@@ -153,23 +277,28 @@ async def ask_agent(request: PromptRequest):
         raise HTTPException(status_code=500, detail=str(e))
 
 @app.get("/ask-stream")
-async def ask_agent_stream(prompt: str, timeout: int = 60):
+async def ask_agent_stream(prompt: str, timeout: int = 300):
     """
     Streaming endpoint that shows the agent's thinking process in real-time.
     """
+    if csv_agent is None:
+        raise HTTPException(status_code=400, detail="No CSV file loaded. Please upload a CSV file first.")
+    
     request_id = f"req_{len(active_requests)}"
     active_requests[request_id] = True
     
     async def generate_response():
         try:
-            # Capture the agent's verbose output
+            # Create verbose capture to get agent output
             def run_agent_with_capture():
-                with AgentOutputCapture() as capture:
-                    try:
-                        result = csv_agent.run(prompt)
-                        return result, capture.get_output()
-                    except Exception as e:
-                        return str(e), capture.get_output()
+                capture = VerboseCapture()
+                try:
+                    with capture.capture():
+                        response = csv_agent.invoke({"input": prompt})
+                        result = response.get("output", "No response generated")
+                    return result, capture.get_formatted_steps()
+                except Exception as e:
+                    return str(e), capture.get_formatted_steps()
             
             # Run agent in thread with timeout
             loop = asyncio.get_event_loop()
@@ -179,17 +308,16 @@ async def ask_agent_stream(prompt: str, timeout: int = 60):
             yield f"data: {json.dumps({'type': 'start', 'message': 'Agent started processing...', 'request_id': request_id})}\n\n"
             
             try:
-                result, captured_output = await asyncio.wait_for(future, timeout=timeout)
+                result, captured_steps = await asyncio.wait_for(future, timeout=timeout)
                 
-                # Parse and stream the captured output
-                if captured_output:
-                    lines = captured_output.split('\n')
-                    for line in lines:
-                        if line.strip() and not active_requests.get(request_id, False):
+                # Stream the captured steps
+                if captured_steps:
+                    for step in captured_steps:
+                        if not active_requests.get(request_id, False):
                             break
-                        if line.strip():
-                            yield f"data: {json.dumps({'type': 'thinking', 'message': line.strip(), 'request_id': request_id})}\n\n"
-                            await asyncio.sleep(0.1)  # Small delay for better UX
+                        if step.strip():
+                            yield f"data: {json.dumps({'type': 'thinking', 'message': step.strip(), 'request_id': request_id})}\n\n"
+                            await asyncio.sleep(0.3)  # Small delay for better readability
                 
                 # Send final result
                 if active_requests.get(request_id, False):
@@ -232,14 +360,21 @@ async def get_data_info():
     """
     Endpoint to get information about the loaded CSV data.
     """
+    if current_csv_path is None or not os.path.exists(current_csv_path):
+        return {"error": "No CSV file loaded. Please upload a CSV file first."}
+        
     try:
         import pandas as pd
-        df = pd.read_csv(CSV_FILE_PATH)
+        df = pd.read_csv(current_csv_path)
+        # Convert sample data to JSON-safe format (handle NaN values)
+        sample_data = df.head().fillna("").to_dict()
+        
         return {
             "rows": len(df),
             "columns": list(df.columns),
-            "file_path": CSV_FILE_PATH,
-            "sample_data": df.head().to_dict()
+            "file_path": current_csv_path,
+            "filename": os.path.basename(current_csv_path),
+            "sample_data": sample_data
         }
     except Exception as e:
         return {"error": f"Could not read CSV file: {str(e)}"}
