@@ -17,26 +17,54 @@ import sys
 # LangChain imports
 from langchain_groq import ChatGroq
 from langchain_experimental.agents.agent_toolkits import create_csv_agent
+from langchain_community.agent_toolkits.sql.toolkit import SQLDatabaseToolkit
+from langchain_community.utilities import SQLDatabase
+from langchain_community.agent_toolkits.sql.base import create_sql_agent
 from langchain.agents import AgentType
+
+# Database imports
+from database.schema import (
+    create_database_schema, 
+    import_csv_to_database, 
+    get_database_engine,
+    get_database_schema_info,
+    validate_database,
+    DB_PATH, 
+    DB_URL
+)
 
 # --- Configuration ---
 # Load environment variables from .env file
 load_dotenv()
 
-# CSV file management
+# File management
 UPLOADS_DIR = "uploads"
-DEFAULT_CSV_PATH = "data/dataset.csv"
-current_csv_path = DEFAULT_CSV_PATH
+DEFAULT_CSV_PATH = "uploads/GSP Standardized Sheet - May_2025_standard.csv"
 
 # Create uploads directory
 os.makedirs(UPLOADS_DIR, exist_ok=True)
 
-# Check if default CSV file exists
-if os.path.exists(DEFAULT_CSV_PATH):
-    print(f"Default CSV file found: {DEFAULT_CSV_PATH}")
+# Database setup
+current_db_path = DB_PATH
+current_csv_path = DEFAULT_CSV_PATH
+
+# Check if database exists, if not create it from default CSV
+if not os.path.exists(current_db_path):
+    print("Database not found. Creating new database...")
+    create_database_schema()
+    if os.path.exists(DEFAULT_CSV_PATH):
+        print(f"Importing default CSV: {DEFAULT_CSV_PATH}")
+        stats = import_csv_to_database(DEFAULT_CSV_PATH)
+        print(f"Imported {stats['total_records']} records")
+    else:
+        print("No default CSV found. Database created but empty.")
 else:
-    current_csv_path = None
-    print("No default CSV file found. Please upload a CSV file to get started.")
+    print(f"Database found: {current_db_path}")
+    validation = validate_database()
+    if validation['valid']:
+        print(f"Database validated: {validation['total_records']} records")
+    else:
+        print(f"Database validation failed: {validation['error']}")
 
 # Set up Pydantic models for request bodies
 class PromptRequest(BaseModel):
@@ -79,9 +107,32 @@ try:
 except Exception as e:
     raise HTTPException(status_code=500, detail=f"Failed to initialize ChatGroq: {e}.")
 
-# Create CSV agent function
+# Create SQL agent function
+def create_sql_agent_instance(db_path: str = None):
+    """Create a new SQL agent instance for the database"""
+    db_path = db_path or current_db_path
+    if not os.path.exists(db_path):
+        return None
+    try:
+        # Create database connection
+        db = SQLDatabase.from_uri(f"sqlite:///{db_path}")
+        
+        # Create SQL agent with custom prompt for student data
+        agent = create_sql_agent(
+            llm=groq_llm,
+            db=db,
+            agent_type=AgentType.ZERO_SHOT_REACT_DESCRIPTION,
+            verbose=True,
+            return_intermediate_steps=True
+        )
+        
+        return agent, db
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Failed to create SQL agent: {e}")
+
+# Keep CSV agent function for backward compatibility during transition
 def create_csv_agent_instance(csv_file_path):
-    """Create a new CSV agent instance for the given file"""
+    """Create a new CSV agent instance for the given file (legacy)"""
     if not csv_file_path or not os.path.exists(csv_file_path):
         return None
     try:
@@ -90,22 +141,98 @@ def create_csv_agent_instance(csv_file_path):
             csv_file_path,
             verbose=True,
             agent_type=AgentType.ZERO_SHOT_REACT_DESCRIPTION,
-            allow_dangerous_code=True  # Required for CSV agent to execute pandas code
+            allow_dangerous_code=True
         )
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Failed to create CSV agent: {e}")
 
-# Create a global agent instance (if default file exists)
-csv_agent = create_csv_agent_instance(current_csv_path) if current_csv_path else None
+# Create a global SQL agent instance
+sql_agent_data = create_sql_agent_instance() if os.path.exists(current_db_path) else None
 
-if csv_agent:
-    print(f"CSV agent initialized successfully with file: {current_csv_path}")
+if sql_agent_data:
+    sql_agent, sql_db = sql_agent_data
+    print(f"SQL agent initialized successfully with database: {current_db_path}")
 else:
-    print("No CSV agent initialized. Upload a file to create one.")
+    sql_agent, sql_db = None, None
+    print("No SQL agent initialized. Database not found.")
+
+# Legacy CSV agent for fallback
+csv_agent = create_csv_agent_instance(current_csv_path) if current_csv_path and os.path.exists(current_csv_path) else None
 
 # Simple stdout capture for agent verbose output
 import contextlib
 from io import StringIO
+
+import queue
+import threading
+
+class StreamingVerboseCapture:
+    def __init__(self):
+        self.output_queue = queue.Queue()
+        self.captured_output = StringIO()
+        self.streaming = True
+        
+    @contextlib.contextmanager
+    def capture(self):
+        old_stdout = sys.stdout
+        old_stderr = sys.stderr
+        try:
+            sys.stdout = self
+            sys.stderr = self
+            yield self
+        finally:
+            sys.stdout = old_stdout
+            sys.stderr = old_stderr
+            self.streaming = False
+            
+    def write(self, text):
+        """Custom write method that captures output and puts it in queue for streaming"""
+        # Also write to captured_output for final retrieval
+        self.captured_output.write(text)
+        
+        # Only queue non-empty lines for streaming
+        if text.strip() and self.streaming:
+            self.output_queue.put(text.strip())
+            
+    def flush(self):
+        """Required for stdout compatibility"""
+        pass
+        
+    def get_streaming_line(self, timeout=0.1):
+        """Get the next line for streaming (non-blocking)"""
+        try:
+            return self.output_queue.get(timeout=timeout)
+        except queue.Empty:
+            return None
+            
+    def get_output(self):
+        return self.captured_output.getvalue()
+        
+    def format_line(self, line):
+        """Format a single line for display"""
+        if not line or not line.strip():
+            return None
+            
+        line = line.strip()
+        
+        # Format different types of output
+        if line.startswith('Thought:'):
+            return f"🤔 {line}"
+        elif line.startswith('Action:'):
+            return f"🛠️ {line}"
+        elif line.startswith('Action Input:'):
+            return f"📝 {line}"
+        elif line.startswith('Observation:'):
+            # Truncate long observations
+            obs = line[12:] if len(line) > 12 else ""
+            if len(obs) > 200:
+                obs = obs[:200] + "..."
+            return f"✅ Observation: {obs}"
+        elif 'Final Answer:' in line:
+            return f"🎯 {line}"
+        elif line and len(line.strip()) > 0:
+            return f"💭 {line}"
+        return None
 
 class VerboseCapture:
     def __init__(self):
@@ -182,8 +309,8 @@ async def health_check():
 
 @app.post("/upload")
 async def upload_csv_file(file: UploadFile = File(...)):
-    """Upload a CSV file and create a new agent for it"""
-    global csv_agent, current_csv_path
+    """Upload a CSV file and import it into the database"""
+    global sql_agent, sql_db, current_csv_path
     
     # Validate file type
     if not file.filename or not file.filename.endswith('.csv'):
@@ -212,31 +339,38 @@ async def upload_csv_file(file: UploadFile = File(...)):
             os.remove(file_path)  # Clean up invalid file
             raise HTTPException(status_code=400, detail=f"Invalid CSV file: {str(e)}")
         
-        # Create new CSV agent
-        new_agent = create_csv_agent_instance(file_path)
-        if new_agent is None:
-            os.remove(file_path)
-            raise HTTPException(status_code=500, detail="Failed to create CSV agent")
-        
-        # Update global state
-        old_csv_path = current_csv_path
-        csv_agent = new_agent
-        current_csv_path = file_path
-        
-        # Clean up old uploaded file (but not the default file)
-        if old_csv_path and old_csv_path != DEFAULT_CSV_PATH and os.path.exists(old_csv_path):
-            os.remove(old_csv_path)
-        
-        # Convert sample data to JSON-safe format (handle NaN values)
-        sample_data = df.head().fillna("").to_dict()
-        
-        return {
-            "message": "CSV file uploaded successfully",
-            "filename": file.filename,
-            "rows": len(df),
-            "columns": list(df.columns),
-            "sample_data": sample_data
-        }
+        # Import CSV into database
+        try:
+            # Create fresh database schema
+            create_database_schema()
+            
+            # Import the new CSV data
+            stats = import_csv_to_database(file_path)
+            
+            # Create new SQL agent
+            sql_agent_data = create_sql_agent_instance()
+            if sql_agent_data is None:
+                raise HTTPException(status_code=500, detail="Failed to create SQL agent after import")
+            
+            # Update global state
+            sql_agent, sql_db = sql_agent_data
+            current_csv_path = file_path
+            
+            return {
+                "message": "CSV file uploaded and imported to database successfully",
+                "filename": file.filename,
+                "total_records": stats['total_records'],
+                "unique_categories": stats['unique_categories'],
+                "unique_cities": stats['unique_cities'],
+                "unique_schools": stats['unique_schools'],
+                "database_path": stats['db_path']
+            }
+            
+        except Exception as e:
+            # Clean up file on database import error
+            if os.path.exists(file_path):
+                os.remove(file_path)
+            raise HTTPException(status_code=500, detail=f"Database import failed: {str(e)}")
         
     except HTTPException:
         raise
@@ -250,24 +384,27 @@ async def upload_csv_file(file: UploadFile = File(...)):
 @app.post("/ask")
 async def ask_agent(request: PromptRequest):
     """
-    Standard endpoint to send a prompt to the CSV agent and get a complete response.
+    Standard endpoint to send a prompt to the SQL agent and get a complete response.
     """
-    if csv_agent is None:
-        raise HTTPException(status_code=400, detail="No CSV file loaded. Please upload a CSV file first.")
+    if sql_agent is None:
+        raise HTTPException(status_code=400, detail="No database loaded. Please upload a CSV file first.")
     
     try:
-        # Run the CSV agent with timeout
+        # Run the SQL agent with timeout
         def run_agent():
-            response = csv_agent.invoke({"input": request.prompt})
+            response = sql_agent.invoke({"input": request.prompt})
             return response.get("output", "No response generated")
         
         # Execute with timeout
         try:
             loop = asyncio.get_event_loop()
-            result = await asyncio.wait_for(
-                loop.run_in_executor(None, run_agent),
-                timeout=request.timeout
-            )
+            if request.timeout > 0:
+                result = await asyncio.wait_for(
+                    loop.run_in_executor(None, run_agent),
+                    timeout=request.timeout
+                )
+            else:
+                result = await loop.run_in_executor(None, run_agent)
             return {"response": result}
         except asyncio.TimeoutError:
             raise HTTPException(status_code=408, detail=f"Agent response timed out after {request.timeout} seconds")
@@ -279,54 +416,112 @@ async def ask_agent(request: PromptRequest):
 @app.get("/ask-stream")
 async def ask_agent_stream(prompt: str, timeout: int = 300):
     """
-    Streaming endpoint that shows the agent's thinking process in real-time.
+    Streaming endpoint that shows the SQL agent's thinking process in real-time.
     """
-    if csv_agent is None:
-        raise HTTPException(status_code=400, detail="No CSV file loaded. Please upload a CSV file first.")
+    if sql_agent is None:
+        raise HTTPException(status_code=400, detail="No database loaded. Please upload a CSV file first.")
     
     request_id = f"req_{len(active_requests)}"
     active_requests[request_id] = True
     
     async def generate_response():
         try:
-            # Create verbose capture to get agent output
-            def run_agent_with_capture():
-                capture = VerboseCapture()
+            # Create streaming verbose capture
+            capture = StreamingVerboseCapture()
+            agent_result = None
+            agent_error = None
+            
+            def run_agent_with_streaming_capture():
+                nonlocal agent_result, agent_error
                 try:
                     with capture.capture():
-                        response = csv_agent.invoke({"input": prompt})
-                        result = response.get("output", "No response generated")
-                    return result, capture.get_formatted_steps()
+                        response = sql_agent.invoke({"input": prompt})
+                        agent_result = response.get("output", "No response generated")
                 except Exception as e:
-                    return str(e), capture.get_formatted_steps()
+                    agent_error = str(e)
             
-            # Run agent in thread with timeout
+            # Start agent in background thread
             loop = asyncio.get_event_loop()
-            future = loop.run_in_executor(None, run_agent_with_capture)
             
             # Stream initial message
             yield f"data: {json.dumps({'type': 'start', 'message': 'Agent started processing...', 'request_id': request_id})}\n\n"
             
-            try:
-                result, captured_steps = await asyncio.wait_for(future, timeout=timeout)
+            if timeout > 0:
+                # Run with timeout
+                agent_task = asyncio.create_task(loop.run_in_executor(None, run_agent_with_streaming_capture))
+                start_time = asyncio.get_event_loop().time()
                 
-                # Stream the captured steps
-                if captured_steps:
-                    for step in captured_steps:
-                        if not active_requests.get(request_id, False):
-                            break
-                        if step.strip():
-                            yield f"data: {json.dumps({'type': 'thinking', 'message': step.strip(), 'request_id': request_id})}\n\n"
-                            await asyncio.sleep(0.3)  # Small delay for better readability
-                
-                # Send final result
-                if active_requests.get(request_id, False):
-                    yield f"data: {json.dumps({'type': 'result', 'message': result, 'request_id': request_id})}\n\n"
-                else:
-                    yield f"data: {json.dumps({'type': 'aborted', 'message': 'Request was aborted', 'request_id': request_id})}\n\n"
+                while not agent_task.done():
+                    # Check for abort
+                    if not active_requests.get(request_id, False):
+                        agent_task.cancel()
+                        yield f"data: {json.dumps({'type': 'aborted', 'message': 'Request was aborted', 'request_id': request_id})}\n\n"
+                        return
                     
-            except asyncio.TimeoutError:
-                yield f"data: {json.dumps({'type': 'timeout', 'message': f'Agent response timed out after {timeout} seconds', 'request_id': request_id})}\n\n"
+                    # Check for timeout
+                    elapsed = asyncio.get_event_loop().time() - start_time
+                    if elapsed > timeout:
+                        agent_task.cancel()
+                        yield f"data: {json.dumps({'type': 'timeout', 'message': f'Agent response timed out after {timeout} seconds', 'request_id': request_id})}\n\n"
+                        return
+                    
+                    # Stream any new output
+                    line = capture.get_streaming_line()
+                    if line:
+                        formatted_line = capture.format_line(line)
+                        if formatted_line:
+                            yield f"data: {json.dumps({'type': 'thinking', 'message': formatted_line, 'request_id': request_id})}\n\n"
+                    
+                    await asyncio.sleep(0.1)  # Check every 100ms
+                
+                # Wait for completion
+                try:
+                    await agent_task
+                except asyncio.CancelledError:
+                    return
+                    
+            else:
+                # Run without timeout
+                agent_task = asyncio.create_task(loop.run_in_executor(None, run_agent_with_streaming_capture))
+                
+                while not agent_task.done():
+                    # Check for abort
+                    if not active_requests.get(request_id, False):
+                        agent_task.cancel()
+                        yield f"data: {json.dumps({'type': 'aborted', 'message': 'Request was aborted', 'request_id': request_id})}\n\n"
+                        return
+                    
+                    # Stream any new output
+                    line = capture.get_streaming_line()
+                    if line:
+                        formatted_line = capture.format_line(line)
+                        if formatted_line:
+                            yield f"data: {json.dumps({'type': 'thinking', 'message': formatted_line, 'request_id': request_id})}\n\n"
+                    
+                    await asyncio.sleep(0.1)  # Check every 100ms
+                
+                # Wait for completion
+                try:
+                    await agent_task
+                except asyncio.CancelledError:
+                    return
+            
+            # Stream any remaining output
+            while True:
+                line = capture.get_streaming_line()
+                if line:
+                    formatted_line = capture.format_line(line)
+                    if formatted_line:
+                        yield f"data: {json.dumps({'type': 'thinking', 'message': formatted_line, 'request_id': request_id})}\n\n"
+                else:
+                    break
+            
+            # Send final result
+            if active_requests.get(request_id, False):
+                if agent_error:
+                    yield f"data: {json.dumps({'type': 'error', 'message': agent_error, 'request_id': request_id})}\n\n"
+                else:
+                    yield f"data: {json.dumps({'type': 'result', 'message': agent_result, 'request_id': request_id})}\n\n"
                 
         except Exception as e:
             yield f"data: {json.dumps({'type': 'error', 'message': str(e), 'request_id': request_id})}\n\n"
@@ -358,26 +553,47 @@ async def abort_request(request_id: str):
 @app.get("/data-info")
 async def get_data_info():
     """
-    Endpoint to get information about the loaded CSV data.
+    Endpoint to get information about the loaded database.
     """
-    if current_csv_path is None or not os.path.exists(current_csv_path):
-        return {"error": "No CSV file loaded. Please upload a CSV file first."}
+    if not os.path.exists(current_db_path):
+        return {"error": "No database found. Please upload a CSV file first."}
         
     try:
-        import pandas as pd
-        df = pd.read_csv(current_csv_path)
-        # Convert sample data to JSON-safe format (handle NaN values)
-        sample_data = df.head().fillna("").to_dict()
+        schema_info = get_database_schema_info()
+        
+        if "error" in schema_info:
+            return schema_info
         
         return {
-            "rows": len(df),
-            "columns": list(df.columns),
-            "file_path": current_csv_path,
-            "filename": os.path.basename(current_csv_path),
-            "sample_data": sample_data
+            "table_name": schema_info["table_name"],
+            "total_records": schema_info["row_count"],
+            "columns": [col["name"] for col in schema_info["columns"]],
+            "column_details": schema_info["columns"],
+            "database_path": schema_info["db_path"],
+            "sample_data": schema_info["sample_data"][:3] if schema_info["sample_data"] else []
         }
     except Exception as e:
-        return {"error": f"Could not read CSV file: {str(e)}"}
+        return {"error": f"Could not read database: {str(e)}"}
+
+@app.get("/schema")
+async def get_database_schema():
+    """
+    Endpoint to get detailed database schema information for debugging.
+    """
+    if not os.path.exists(current_db_path):
+        return {"error": "No database found. Please upload a CSV file first."}
+        
+    try:
+        schema_info = get_database_schema_info()
+        validation = validate_database()
+        
+        return {
+            "database_info": schema_info,
+            "validation": validation,
+            "database_path": current_db_path
+        }
+    except Exception as e:
+        return {"error": f"Could not get schema info: {str(e)}"}
 
 # --- Main entry point for local development ---
 if __name__ == "__main__":

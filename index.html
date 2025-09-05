@@ -93,6 +93,7 @@ You can ask complex questions and the agent will analyze the CSV data to provide
                     <option value="120">2 minutes</option>
                     <option value="300" selected>5 minutes</option>
                     <option value="600">10 minutes</option>
+                    <option value="0">No Timeout</option>
                 </select>
             </div>
             <div id="abortSection" class="hidden flex items-center space-x-2">
@@ -520,6 +521,12 @@ You can ask complex questions and the agent will analyze the CSV data to provide
         
         function startCountdown(totalSeconds) {
             abortSection.classList.remove('hidden');
+            
+            if (totalSeconds === 0) {
+                countdown.textContent = 'No Timeout';
+                return;
+            }
+            
             let remaining = totalSeconds;
             
             countdownInterval = setInterval(() => {
