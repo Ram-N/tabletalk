@@ -16,6 +16,7 @@ import sys
 
 # LangChain imports
 from langchain_groq import ChatGroq
+from langchain_anthropic import ChatAnthropic
 from langchain_experimental.agents.agent_toolkits import create_csv_agent
 from langchain_community.agent_toolkits.sql.toolkit import SQLDatabaseToolkit
 from langchain_community.utilities import SQLDatabase
@@ -95,17 +96,48 @@ app.add_middleware(
 )
 
 # --- Agent and Tool Setup ---
-# Get API key from environment variables
+# Get API keys from environment variables
 groq_api_key = os.getenv("GROQ_API_KEY")
+anthropic_api_key = os.getenv("ANTHROPIC_API_KEY")
 
-if not groq_api_key:
-    raise HTTPException(status_code=500, detail="GROQ_API_KEY is not set. Please add it to your .env file or environment variables.")
+# Initialize LLM (prefer Anthropic if available, fallback to Groq)
+selected_llm = None
+llm_provider = None
 
-# Initialize the Groq LLM
-try:
-    groq_llm = ChatGroq(model="llama-3.1-8b-instant", groq_api_key=groq_api_key, temperature=0)
-except Exception as e:
-    raise HTTPException(status_code=500, detail=f"Failed to initialize ChatGroq: {e}.")
+if anthropic_api_key:
+    try:
+        selected_llm = ChatAnthropic(
+            model="claude-3-5-sonnet-20241022",
+            anthropic_api_key=anthropic_api_key,
+            temperature=0,
+            max_tokens=4096
+        )
+        llm_provider = "anthropic"
+        print(f"✅ Using Anthropic Claude API")
+    except Exception as e:
+        print(f"⚠️  Failed to initialize Anthropic: {e}")
+        selected_llm = None
+
+if not selected_llm and groq_api_key:
+    try:
+        selected_llm = ChatGroq(
+            model="llama-3.1-8b-instant", 
+            groq_api_key=groq_api_key, 
+            temperature=0
+        )
+        llm_provider = "groq"
+        print(f"✅ Using Groq API")
+    except Exception as e:
+        print(f"⚠️  Failed to initialize Groq: {e}")
+
+if not selected_llm:
+    raise HTTPException(
+        status_code=500, 
+        detail="No valid API key found. Please set either ANTHROPIC_API_KEY or GROQ_API_KEY in your .env file."
+    )
+
+# Use the selected LLM
+groq_llm = selected_llm  # Keep variable name for backward compatibility
 
 # Create SQL agent function
 def create_sql_agent_instance(db_path: str = None):
@@ -300,7 +332,14 @@ async def root():
 
 @app.get("/api")
 async def api_info():
-    return {"message": "TableTalk CSV Agent API is running", "endpoints": ["/ask", "/ask-stream", "/abort/{request_id}", "/upload", "/data-info", "/health", "/docs"], "status": "online", "timestamp": asyncio.get_event_loop().time()}
+    return {
+        "message": "TableTalk SQL Agent API is running", 
+        "endpoints": ["/ask", "/ask-stream", "/abort/{request_id}", "/upload", "/data-info", "/schema", "/health", "/docs"],
+        "status": "online", 
+        "llm_provider": llm_provider,
+        "database_records": 174,  # Will be dynamic later
+        "timestamp": asyncio.get_event_loop().time()
+    }
 
 @app.get("/health")
 async def health_check():
@@ -392,8 +431,35 @@ async def ask_agent(request: PromptRequest):
     try:
         # Run the SQL agent with timeout
         def run_agent():
-            response = sql_agent.invoke({"input": request.prompt})
-            return response.get("output", "No response generated")
+            try:
+                import asyncio
+                
+                # Direct synchronous call to agent
+                response = sql_agent.invoke({"input": request.prompt})
+                
+                # Handle any Future objects
+                if hasattr(response, 'result') and callable(getattr(response, 'result')):
+                    response = response.result()
+                
+                # If it's still a coroutine, force it to sync
+                if asyncio.iscoroutine(response):
+                    try:
+                        new_loop = asyncio.new_event_loop()
+                        asyncio.set_event_loop(new_loop)
+                        response = new_loop.run_until_complete(response)
+                        new_loop.close()
+                    except Exception as loop_error:
+                        return f"Failed to handle async response: {str(loop_error)}"
+                
+                # Handle different response formats
+                if hasattr(response, 'get'):
+                    return response.get("output", str(response))
+                elif isinstance(response, dict):
+                    return response.get("output", str(response))
+                else:
+                    return str(response)
+            except Exception as e:
+                return f"Agent error: {str(e)}"
         
         # Execute with timeout
         try:
@@ -435,76 +501,80 @@ async def ask_agent_stream(prompt: str, timeout: int = 300):
                 nonlocal agent_result, agent_error
                 try:
                     with capture.capture():
-                        response = sql_agent.invoke({"input": prompt})
-                        agent_result = response.get("output", "No response generated")
+                        # Force synchronous execution by bypassing any async wrappers
+                        import asyncio
+                        import concurrent.futures
+                        
+                        # Create a completely clean sync execution
+                        try:
+                            # Direct synchronous call to agent
+                            response = sql_agent.invoke({"input": prompt})
+                            
+                            # Handle any Future objects
+                            if hasattr(response, 'result') and callable(getattr(response, 'result')):
+                                response = response.result()
+                            
+                            # If it's still a coroutine after all that, force it to sync
+                            if asyncio.iscoroutine(response):
+                                # Create a new event loop just for this
+                                try:
+                                    new_loop = asyncio.new_event_loop()
+                                    asyncio.set_event_loop(new_loop)
+                                    response = new_loop.run_until_complete(response)
+                                    new_loop.close()
+                                except Exception as loop_error:
+                                    agent_error = f"Failed to handle async response: {str(loop_error)}"
+                                    return
+                            
+                            # Handle different response formats
+                            if hasattr(response, 'get'):
+                                agent_result = response.get("output", str(response))
+                            elif isinstance(response, dict):
+                                agent_result = response.get("output", str(response))
+                            else:
+                                agent_result = str(response)
+                                
+                        except Exception as invoke_error:
+                            agent_error = f"Agent invoke error: {str(invoke_error)}"
+                            
                 except Exception as e:
-                    agent_error = str(e)
-            
-            # Start agent in background thread
-            loop = asyncio.get_event_loop()
+                    agent_error = f"Agent execution error: {str(e)}"
             
             # Stream initial message
             yield f"data: {json.dumps({'type': 'start', 'message': 'Agent started processing...', 'request_id': request_id})}\n\n"
             
-            if timeout > 0:
-                # Run with timeout
-                agent_task = asyncio.create_task(loop.run_in_executor(None, run_agent_with_streaming_capture))
-                start_time = asyncio.get_event_loop().time()
+            # Run agent completely synchronously in a thread with proper isolation
+            agent_thread = threading.Thread(target=run_agent_with_streaming_capture)
+            agent_thread.daemon = True
+            agent_thread.start()
+            
+            # Monitor progress and stream output
+            start_time = asyncio.get_event_loop().time()
+            
+            while agent_thread.is_alive():
+                # Check for abort
+                if not active_requests.get(request_id, False):
+                    yield f"data: {json.dumps({'type': 'aborted', 'message': 'Request was aborted', 'request_id': request_id})}\n\n"
+                    return
                 
-                while not agent_task.done():
-                    # Check for abort
-                    if not active_requests.get(request_id, False):
-                        agent_task.cancel()
-                        yield f"data: {json.dumps({'type': 'aborted', 'message': 'Request was aborted', 'request_id': request_id})}\n\n"
-                        return
-                    
-                    # Check for timeout
+                # Check for timeout (only if timeout > 0)
+                if timeout > 0:
                     elapsed = asyncio.get_event_loop().time() - start_time
                     if elapsed > timeout:
-                        agent_task.cancel()
                         yield f"data: {json.dumps({'type': 'timeout', 'message': f'Agent response timed out after {timeout} seconds', 'request_id': request_id})}\n\n"
                         return
-                    
-                    # Stream any new output
-                    line = capture.get_streaming_line()
-                    if line:
-                        formatted_line = capture.format_line(line)
-                        if formatted_line:
-                            yield f"data: {json.dumps({'type': 'thinking', 'message': formatted_line, 'request_id': request_id})}\n\n"
-                    
-                    await asyncio.sleep(0.1)  # Check every 100ms
                 
-                # Wait for completion
-                try:
-                    await agent_task
-                except asyncio.CancelledError:
-                    return
-                    
-            else:
-                # Run without timeout
-                agent_task = asyncio.create_task(loop.run_in_executor(None, run_agent_with_streaming_capture))
+                # Stream any new output
+                line = capture.get_streaming_line()
+                if line:
+                    formatted_line = capture.format_line(line)
+                    if formatted_line:
+                        yield f"data: {json.dumps({'type': 'thinking', 'message': formatted_line, 'request_id': request_id})}\n\n"
                 
-                while not agent_task.done():
-                    # Check for abort
-                    if not active_requests.get(request_id, False):
-                        agent_task.cancel()
-                        yield f"data: {json.dumps({'type': 'aborted', 'message': 'Request was aborted', 'request_id': request_id})}\n\n"
-                        return
-                    
-                    # Stream any new output
-                    line = capture.get_streaming_line()
-                    if line:
-                        formatted_line = capture.format_line(line)
-                        if formatted_line:
-                            yield f"data: {json.dumps({'type': 'thinking', 'message': formatted_line, 'request_id': request_id})}\n\n"
-                    
-                    await asyncio.sleep(0.1)  # Check every 100ms
-                
-                # Wait for completion
-                try:
-                    await agent_task
-                except asyncio.CancelledError:
-                    return
+                await asyncio.sleep(0.1)  # Check every 100ms
+            
+            # Wait for thread to complete
+            agent_thread.join(timeout=1.0)
             
             # Stream any remaining output
             while True:
