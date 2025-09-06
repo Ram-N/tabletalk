@@ -7,8 +7,11 @@
 __pycache__/
 *.pyc
 
-# Data files (sensitive)
+# Data files (sensitive student information)
 data/
+uploads/*.csv
+database/students.db
+database/__pycache__/
 
 # IDE and editor files
 .vscode/
